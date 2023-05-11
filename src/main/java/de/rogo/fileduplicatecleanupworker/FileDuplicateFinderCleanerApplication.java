@@ -14,7 +14,7 @@ public class FileDuplicateFinderCleanerApplication extends Application {
     @Override
     public void start(Stage stage) throws IOException {
         FXMLLoader fxmlLoader = new FXMLLoader(FileDuplicateFinderCleanerApplication.class.getResource("hello-view.fxml"));
-        Scene scene = new Scene(fxmlLoader.load(), 480, 240);
+        Scene scene = new Scene(fxmlLoader.load());
         stage.setTitle("File duplicate finder / cleaner");
         stage.setScene(scene);
         stage.show();

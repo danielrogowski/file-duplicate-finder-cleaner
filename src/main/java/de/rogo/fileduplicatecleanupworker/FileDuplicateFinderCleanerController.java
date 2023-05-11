@@ -1,11 +1,10 @@
 package de.rogo.fileduplicatecleanupworker;
 
+import javafx.application.Platform;
 import javafx.concurrent.Task;
 import javafx.fxml.FXML;
-import javafx.fxml.Initializable;
-import javafx.scene.control.Alert;
+import javafx.scene.control.*;
 import javafx.scene.control.Button;
-import javafx.scene.control.ButtonType;
 import javafx.scene.control.TextArea;
 import javafx.scene.layout.VBox;
 import javafx.stage.DirectoryChooser;
@@ -16,7 +15,6 @@ import java.awt.*;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.security.DigestInputStream;
@@ -24,10 +22,11 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
-public class FileDuplicateFinderCleanerController implements Initializable {
+public class FileDuplicateFinderCleanerController {
 
     @FXML
     private VBox root;
@@ -41,10 +40,12 @@ public class FileDuplicateFinderCleanerController implements Initializable {
     @FXML
     private Button startLooking;
 
-    @Override
-    public void initialize(URL location, ResourceBundle resources) {
-        startLooking.disableProperty().bind(directoryText.textProperty().isNull().or(directoryText.textProperty().isEmpty()));
-    }
+    @FXML
+    private ProgressIndicator progressIndicator;
+
+    private final Object hashingMutex = new Object();
+
+    private int filesProcessed;
 
     @FXML
     protected void onChoosePathButtonClick() {
@@ -52,6 +53,7 @@ public class FileDuplicateFinderCleanerController implements Initializable {
         val dir = directoryChooser.showDialog(root.getScene().getWindow());
 
         if (dir != null) {
+            startLooking.setDisable(false);
             if (!directoryText.getText().isEmpty()) {
                 directoryText.appendText("\n" + dir.getAbsolutePath());
             } else {
@@ -66,8 +68,137 @@ public class FileDuplicateFinderCleanerController implements Initializable {
             return;
         }
 
-        for (val entries : findDuplicates().entrySet()) {
-            while(true) {
+        filesProcessed = 0;
+
+        choosePath.setDisable(true);
+        startLooking.setDisable(true);
+        progressIndicator.setVisible(true);
+        progressIndicator.setProgress(ProgressIndicator.INDETERMINATE_PROGRESS);
+
+        new Thread(() -> {
+            val searchResult = findDuplicates().entrySet();
+            Platform.runLater(() -> {
+                progressIndicator.setVisible(false);
+                displaySearchResults(searchResult);
+                directoryText.setText("");
+                choosePath.setDisable(false);
+            });
+        }).start();
+    }
+
+    protected Map<String, List<File>> findDuplicates() {
+        // Get the chosen directory
+        val directoryText = this.directoryText.getText();
+        val directoryPaths = directoryText.split("\\r?\\n");
+
+        // Map of file sizes to lists of files with those sizes
+        Map<Long, List<File>> sizeMap = new HashMap<>();
+
+        // Iterate over all files in the directory and its subdirectories
+        for (val directoryPath : directoryPaths) {
+            val directory = new File(directoryPath);
+
+            // Check that the directory exists and is a directory
+            if (!directory.exists() || !directory.isDirectory()) {
+                Platform.runLater(() -> {
+                    val alert = new Alert(Alert.AlertType.ERROR, directoryPath + "isn't a valid directory, ignoring...");
+                    alert.showAndWait();
+                });
+                continue;
+            }
+
+            try {
+                Files.walk(directory.toPath())
+                        .filter(Files::isRegularFile)
+                        .forEach(file -> {
+                            try {
+                                val size = Files.size(file);
+                                val files = sizeMap.computeIfAbsent(size, k -> new ArrayList<>());
+                                files.add(file.toFile());
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
+                        });
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        System.out.println(countFilesToHash(sizeMap) + " files to hash");
+
+        // Map of file hashes to lists of files with those hashes
+        Map<String, List<File>> hashMap = new HashMap<>();
+
+        val executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+
+        // Iterate over all files with the same size and compute their hashes
+        for (val entry : sizeMap.entrySet()) {
+            val files = entry.getValue();
+
+            if (files.size() < 2) {
+                continue;
+            }
+
+            for (val file : files) {
+                executor.execute(() -> {
+                    String hash = null;
+
+                    try {
+                        hash = getFileChecksum(file);
+                    } catch (IOException | NoSuchAlgorithmException e) {
+                        e.printStackTrace();
+                    }
+
+                    if (hash != null) {
+                        synchronized (hashingMutex) {
+                            val hashFiles = hashMap.computeIfAbsent(hash, k -> new ArrayList<>());
+                            hashFiles.add(file);
+                        }
+                    }
+
+                    synchronized (System.out) {
+                        System.out.print("\rFiles processed: " + (++filesProcessed));
+                        System.out.flush();
+                    }
+                });
+            }
+        }
+
+        executor.shutdown();
+        for (int tries = 0; tries < 3; tries++) {
+            try {
+                if (executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS)) {
+                    break;
+                }
+            } catch (InterruptedException ignored) {
+            }
+            if (tries == 2) {
+                Platform.runLater(() -> showMessage("The search ended unexpected. Please try again."));
+            }
+        }
+
+        System.out.println("\n" + filesProcessed + " files hashed");
+
+        return removeHardLinks(hashMap);
+    }
+
+    private <K, VV> int countFilesToHash(final Map<K, List<VV>> map) {
+        int result = 0;
+        for (val entry : map.entrySet()) {
+            val list = entry.getValue();
+
+            if (list.size() < 2) {
+                continue;
+            }
+
+            result += list.size();
+        }
+        return result;
+    }
+
+    private void displaySearchResults(Set<Map.Entry<String, List<File>>> searchResult) {
+        for (val entries : searchResult) {
+            while (true) {
                 Alert alert = new Alert(Alert.AlertType.CONFIRMATION);
                 alert.setTitle("Duplicate files found");
                 alert.setHeaderText(String.format("Found %d duplicate file(s)", entries.getValue().size()));
@@ -206,86 +337,26 @@ public class FileDuplicateFinderCleanerController implements Initializable {
         }
     }
 
-    protected Map<String, List<File>> findDuplicates() {
-        // Get the chosen directory
-        String directoryText = this.directoryText.getText();
-        String[] directoryPaths = directoryText.split("\\r?\\n");
-
-        // Map of file sizes to lists of files with those sizes
-        Map<Long, List<File>> sizeMap = new HashMap<>();
-
-        // Iterate over all files in the directory and its subdirectories
-        for (String directoryPath : directoryPaths) {
-            File directory = new File(directoryPath);
-
-            // Check that the directory exists and is a directory
-            if (!directory.exists() || !directory.isDirectory()) {
-                Alert alert = new Alert(Alert.AlertType.ERROR, directoryPath + "isn't a valid directory, ignoring...");
-                alert.showAndWait();
-            }
-
-            try {
-                Files.walk(directory.toPath())
-                        .filter(Files::isRegularFile)
-                        .forEach(file -> {
-                            try {
-                                long size = Files.size(file);
-
-                                List<File> files = sizeMap.getOrDefault(size, new ArrayList<>());
-                                files.add(file.toFile());
-
-                                sizeMap.put(size, files);
-                            } catch (IOException e) {
-                                e.printStackTrace();
-                            }
-                        });
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-
-        // Map of file hashes to lists of files with those hashes
-        Map<String, List<File>> hashMap = new HashMap<>();
-
-        // Iterate over all files with the same size and compute their hashes
-        for (List<File> files : sizeMap.values()) {
-            if (files.size() < 2) {
-                continue;
-            }
-
-            for (File file : files) {
-                String hash = null;
-                try {
-                    hash = getFileChecksum(file);
-                } catch (IOException | NoSuchAlgorithmException e) {
-                    e.printStackTrace();
-                }
-
-                if (hash != null) {
-                    List<File> hashFiles = hashMap.getOrDefault(hash, new ArrayList<>());
-                    hashFiles.add(file);
-
-                    hashMap.put(hash, hashFiles);
-                }
-            }
-        }
-        return removeHardLinks(hashMap);
-    }
-
     private String getFileChecksum(File file) throws IOException, NoSuchAlgorithmException {
-        MessageDigest md = MessageDigest.getInstance("SHA-256");
-        try (DigestInputStream dis = new DigestInputStream(new FileInputStream(file), md)) {
+        val messageDigest = MessageDigest.getInstance("SHA-256");
+
+        try (val dis = new DigestInputStream(new FileInputStream(file), messageDigest)) {
             while (dis.read() != -1) {
             }
         }
-        byte[] digest = md.digest();
+
+        val digest = messageDigest.digest();
+
         if (digest == null) {
             return null;
         }
-        StringBuilder sb = new StringBuilder();
-        for (byte b : digest) {
+
+        val sb = new StringBuilder();
+
+        for (val b : digest) {
             sb.append(String.format("%02x", b));
         }
+
         return sb.toString();
     }
 
