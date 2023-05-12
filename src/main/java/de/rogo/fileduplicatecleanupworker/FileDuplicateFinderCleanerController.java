@@ -17,9 +17,6 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
-import java.security.DigestInputStream;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.Executors;
@@ -43,9 +40,13 @@ public class FileDuplicateFinderCleanerController {
     @FXML
     private ProgressIndicator progressIndicator;
 
-    private final Object hashingMutex = new Object();
+    private final Object listOfDuplicatesListsMutex = new Object();
 
     private int filesProcessed;
+
+    private boolean error = false;
+
+    private final boolean debug = false;
 
     @FXML
     protected void onChoosePathButtonClick() {
@@ -76,7 +77,7 @@ public class FileDuplicateFinderCleanerController {
         progressIndicator.setProgress(ProgressIndicator.INDETERMINATE_PROGRESS);
 
         new Thread(() -> {
-            val searchResult = findDuplicates().entrySet();
+            val searchResult = findDuplicates();
             Platform.runLater(() -> {
                 progressIndicator.setVisible(false);
                 displaySearchResults(searchResult);
@@ -86,13 +87,13 @@ public class FileDuplicateFinderCleanerController {
         }).start();
     }
 
-    protected Map<String, List<File>> findDuplicates() {
+    protected List<List<File>> findDuplicates() {
         // Get the chosen directory
         val directoryText = this.directoryText.getText();
         val directoryPaths = directoryText.split("\\r?\\n");
 
         // Map of file sizes to lists of files with those sizes
-        Map<Long, List<File>> sizeMap = new HashMap<>();
+        final Map<Long, List<File>> sizeMap = new HashMap<>();
 
         // Iterate over all files in the directory and its subdirectories
         for (val directoryPath : directoryPaths) {
@@ -101,8 +102,7 @@ public class FileDuplicateFinderCleanerController {
             // Check that the directory exists and is a directory
             if (!directory.exists() || !directory.isDirectory()) {
                 Platform.runLater(() -> {
-                    val alert = new Alert(Alert.AlertType.ERROR, directoryPath + "isn't a valid directory, ignoring...");
-                    alert.showAndWait();
+                    new Alert(Alert.AlertType.ERROR, directoryPath + "isn't a valid directory, ignoring...").showAndWait();
                 });
                 continue;
             }
@@ -110,58 +110,67 @@ public class FileDuplicateFinderCleanerController {
             try {
                 Files.walk(directory.toPath())
                         .filter(Files::isRegularFile)
+                        .filter(path -> {
+                            try {
+                                return !Files.isHidden(path);
+                            } catch (IOException e) {
+                                processIOException(e);
+                            }
+                            return false;
+                        })
+                        .filter(path -> !path.toString().contains(File.separator + "."))
                         .forEach(file -> {
+                            if (error) {
+                                return;
+                            }
                             try {
                                 val size = Files.size(file);
                                 val files = sizeMap.computeIfAbsent(size, k -> new ArrayList<>());
                                 files.add(file.toFile());
                             } catch (IOException e) {
-                                e.printStackTrace();
+                                processIOException(e);
                             }
                         });
             } catch (IOException e) {
-                e.printStackTrace();
+                processIOException(e);
             }
         }
 
-        System.out.println(countFilesToHash(sizeMap) + " files to hash");
+        System.out.println(countFilesToProcess(sizeMap) + " possible duplicates to process");
 
-        // Map of file hashes to lists of files with those hashes
-        Map<String, List<File>> hashMap = new HashMap<>();
+        final List<List<File>> listOfDuplicatesLists = new LinkedList<>();
 
         val executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
 
-        // Iterate over all files with the same size and compute their hashes
+        // Iterate over all files with the same size and compare
         for (val entry : sizeMap.entrySet()) {
+            if (error) {
+                break;
+            }
+
             val files = entry.getValue();
 
             if (files.size() < 2) {
                 continue;
             }
 
-            for (val file : files) {
-                executor.execute(() -> {
-                    String hash = null;
+            executor.execute(() -> {
+                try {
+                    val numberFiles = files.size();
+                    val compareResult = compareFiles(files);
 
-                    try {
-                        hash = getFileChecksum(file);
-                    } catch (IOException | NoSuchAlgorithmException e) {
-                        e.printStackTrace();
-                    }
-
-                    if (hash != null) {
-                        synchronized (hashingMutex) {
-                            val hashFiles = hashMap.computeIfAbsent(hash, k -> new ArrayList<>());
-                            hashFiles.add(file);
-                        }
+                    synchronized (listOfDuplicatesListsMutex) {
+                        listOfDuplicatesLists.addAll(compareResult);
                     }
 
                     synchronized (System.out) {
-                        System.out.print("\rFiles processed: " + (++filesProcessed));
+                        System.out.print("\rFiles processed: " + (filesProcessed += numberFiles));
                         System.out.flush();
                     }
-                });
-            }
+                } catch (IOException e) {
+                    processIOException(e);
+                }
+            });
         }
 
         executor.shutdown();
@@ -177,12 +186,24 @@ public class FileDuplicateFinderCleanerController {
             }
         }
 
-        System.out.println("\n" + filesProcessed + " files hashed");
+        if (error) {
+            return List.of();
+        }
 
-        return removeHardLinks(hashMap);
+        return removeHardLinks(listOfDuplicatesLists);
     }
 
-    private <K, VV> int countFilesToHash(final Map<K, List<VV>> map) {
+    private void processIOException(IOException e) {
+        error = true;
+        synchronized (Platform.class) {
+            Platform.runLater(() -> new Alert(Alert.AlertType.ERROR,
+                    "An I/O error occured while processing files. Please check your file system for errors")
+                    .showAndWait());
+            e.printStackTrace();
+        }
+    }
+
+    private <K, VV> int countFilesToProcess(final Map<K, List<VV>> map) {
         int result = 0;
         for (val entry : map.entrySet()) {
             val list = entry.getValue();
@@ -196,15 +217,15 @@ public class FileDuplicateFinderCleanerController {
         return result;
     }
 
-    private void displaySearchResults(Set<Map.Entry<String, List<File>>> searchResult) {
-        for (val entries : searchResult) {
+    private void displaySearchResults(final List<List<File>> searchResult) {
+        for (val fileList : searchResult) {
             while (true) {
                 Alert alert = new Alert(Alert.AlertType.CONFIRMATION);
                 alert.setTitle("Duplicate files found");
-                alert.setHeaderText(String.format("Found %d duplicate file(s)", entries.getValue().size()));
+                alert.setHeaderText(String.format("Found %d duplicate file(s)", fileList.size()));
                 alert.setContentText(String.format(
                         "The following files have the same content:\n\n%s\n\nWhat do you want to do?",
-                        entries.getValue().stream().map(File::toString).collect(Collectors.joining("\n"))));
+                        fileList.stream().map(File::toString).collect(Collectors.joining("\n"))));
 
                 ButtonType ignoreButton = new ButtonType("Ignore");
                 ButtonType deleteButton = new ButtonType("Delete");
@@ -221,12 +242,13 @@ public class FileDuplicateFinderCleanerController {
                         return;
                     }
                     if (result.get() == deleteButton) {
-                        entries.getValue().remove(0);
-                        for (val file : entries.getValue()) {
+                        fileList.remove(0);
+                        for (val file : fileList) {
                             try {
                                 Files.delete(file.toPath());
                             } catch (IOException e) {
-                                e.printStackTrace();
+                                processIOException(e);
+                                return;
                             }
                         }
                     } else if (result.get() == chooseButton) {
@@ -239,22 +261,23 @@ public class FileDuplicateFinderCleanerController {
                                 new FileChooser.ExtensionFilter("Audio Files", "*.wav", "*.mp3", "*.aac"),
                                 new FileChooser.ExtensionFilter("Video Files", "*.mp4", "*.avi", "*.flv")
                         );
-                        fileChooser.setInitialDirectory(entries.getValue().get(0).getParentFile());
+                        fileChooser.setInitialDirectory(fileList.get(0).getParentFile());
 
                         File selectedFile = fileChooser.showOpenDialog(root.getScene().getWindow());
 
-                        if (!entries.getValue().contains(selectedFile)) {
+                        if (!fileList.contains(selectedFile)) {
                             showMessage("You didn't choose any of the duplicated files. Please try again...");
                             continue;
                         }
 
                         if (selectedFile != null) {
-                            for (File file : entries.getValue()) {
+                            for (File file : fileList) {
                                 if (!file.equals(selectedFile)) {
                                     try {
                                         Files.delete(file.toPath());
                                     } catch (IOException e) {
-                                        e.printStackTrace();
+                                        processIOException(e);
+                                        return;
                                     }
                                 }
                             }
@@ -262,24 +285,26 @@ public class FileDuplicateFinderCleanerController {
                     } else if (result.get() == moveButton) {
                         FileChooser fileChooser = new FileChooser();
                         fileChooser.setTitle("Choose a location to move the file(s) to");
-                        fileChooser.setInitialFileName(entries.getValue().get(0).getName());
+                        fileChooser.setInitialFileName(fileList.get(0).getName());
                         File destFile = fileChooser.showSaveDialog(root.getScene().getWindow());
 
                         if (destFile != null) {
                             // Move the first file to the chosen location
                             try {
-                                Files.move(entries.getValue().get(0).toPath(), destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                                Files.move(fileList.get(0).toPath(), destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
                             } catch (IOException e) {
-                                e.printStackTrace();
+                                processIOException(e);
+                                return;
                             }
 
                             // Delete the other files
-                            for (int i = 1; i < entries.getValue().size(); i++) {
-                                File file = entries.getValue().get(i);
+                            for (int i = 1; i < fileList.size(); i++) {
+                                File file = fileList.get(i);
                                 try {
                                     Files.delete(file.toPath());
                                 } catch (IOException e) {
-                                    e.printStackTrace();
+                                    processIOException(e);
+                                    return;
                                 }
                             }
                         }
@@ -287,25 +312,30 @@ public class FileDuplicateFinderCleanerController {
                         var desktopAvailable = true;
                         if (!Desktop.isDesktopSupported()) {
                             desktopAvailable = false;
-                            System.out.println("Desktop not supported");
+                            if (debug) {
+                                System.out.println("Desktop not supported");
+                            }
                         }
                         if (!Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
                             desktopAvailable = false;
-                            System.out.println("Desktop file opening not supported");
+                            if (debug) {
+                                System.out.println("Desktop file opening not supported");
+                            }
                         }
 
-                        for (val file : entries.getValue()) {
+                        for (val file : fileList) {
+                            if (error) {
+                                return;
+                            }
                             Task<Void> task;
                             if (desktopAvailable) {
-                                System.out.println("Using Desktop to open file");
                                 task = new Task<>() {
                                     @Override
                                     public Void call() {
-                                        System.out.println("Desktop gets called inside a thread to open file");
                                         try {
                                             Desktop.getDesktop().open(file);
                                         } catch (IOException e) {
-                                            e.printStackTrace();
+                                            processIOException(e);
                                         }
                                         return null;
                                     }
@@ -318,13 +348,12 @@ public class FileDuplicateFinderCleanerController {
                                         try {
                                             pb.start();
                                         } catch (IOException e) {
-                                            e.printStackTrace();
+                                            processIOException(e);
                                         }
                                         return null;
                                     }
                                 };
                             }
-                            System.out.println("Starting thread...");
                             val thread = new Thread(task);
                             thread.setDaemon(true);
                             thread.start();
@@ -337,36 +366,88 @@ public class FileDuplicateFinderCleanerController {
         }
     }
 
-    private String getFileChecksum(File file) throws IOException, NoSuchAlgorithmException {
-        val messageDigest = MessageDigest.getInstance("SHA-256");
-
-        try (val dis = new DigestInputStream(new FileInputStream(file), messageDigest)) {
-            while (dis.read() != -1) {
+    private List<List<File>> compareFiles(List<File> files) throws IOException {
+        if (debug) {
+            synchronized (System.out) {
+                System.out.println("\nFiles to compare:\n\t" + files);
             }
         }
 
-        val digest = messageDigest.digest();
+        List<List<File>> result = new ArrayList<>();
 
-        if (digest == null) {
-            return null;
+        Map<File, Set<File>> map = new HashMap<>();
+
+        List<File> unmatched = new ArrayList<>();
+
+        var j = 1;
+
+        while (true) {
+            val file1 = files.get(0);
+            val file2 = files.get(j);
+            if (filesEqual(file1, file2)) {
+                val set = map.computeIfAbsent(file1, file -> new HashSet<>());
+                set.add(file1);
+                set.add(file2);
+            } else {
+                unmatched.add(file2);
+            }
+
+            if (j + 1 < files.size()) {
+                j++;
+            } else if (unmatched.isEmpty()) {
+                break;
+            } else if (unmatched.size() > 1) {
+                files = unmatched;
+                unmatched = new ArrayList<>();
+                j = 1;
+            } else {
+                break;
+            }
         }
 
-        val sb = new StringBuilder();
-
-        for (val b : digest) {
-            sb.append(String.format("%02x", b));
+        for (val entry : map.entrySet()) {
+            result.add(new ArrayList<>(entry.getValue()));
         }
 
-        return sb.toString();
+        if (debug) {
+            synchronized (System.out) {
+                System.out.println("\nResult:\n\t" + result);
+            }
+        }
+
+        return result;
     }
 
-    private Map<String, List<File>> removeHardLinks(Map<String, List<File>> duplicates) {
+    private static boolean filesEqual(final File file1, final File file2) throws IOException {
+        try (val in1 = new FileInputStream(file1);
+             val in2 = new FileInputStream(file2)) {
+
+            val buf1 = new byte[1024];
+            val buf2 = new byte[1024];
+
+            int n1, n2;
+
+            do {
+                n1 = in1.read(buf1);
+                n2 = in2.read(buf2);
+
+                if (n1 != n2 || !Arrays.equals(buf1, buf2)) {
+                    return false;
+                }
+            } while (n1 > 0);
+        }
+
+        return true;
+    }
+
+
+    private List<List<File>> removeHardLinks(final List<List<File>> listOfDuplicatesLists) {
         // Create a map of inode numbers to files
         Map<String, List<File>> inodes = new HashMap<>();
 
         // Populate the inode map
-        for (List<File> files : duplicates.values()) {
-            for (File file : files) {
+        for (val files : listOfDuplicatesLists) {
+            for (val file : files) {
                 val inode = getFileKey(file);
                 if (inode != null) {
                     inodes.computeIfAbsent(inode, k -> new ArrayList<>()).add(file);
@@ -375,10 +456,10 @@ public class FileDuplicateFinderCleanerController {
         }
 
         // Remove hard-linked files from the duplicate map
-        for (List<File> files : duplicates.values()) {
-            Iterator<File> iterator = files.iterator();
+        for (val files : listOfDuplicatesLists) {
+            val iterator = files.iterator();
             while (iterator.hasNext()) {
-                File file = iterator.next();
+                val file = iterator.next();
                 val inode = getFileKey(file);
                 if (inode != null && inodes.get(inode).size() > 1) {
                     // File is a hard link, remove it from the list
@@ -388,10 +469,10 @@ public class FileDuplicateFinderCleanerController {
             }
         }
 
-        // Remove empty entries from the duplicate map
-        duplicates.values().removeIf(List::isEmpty);
+        // Remove empty entries from the duplicate list
+        listOfDuplicatesLists.removeIf(List::isEmpty);
 
-        return duplicates;
+        return listOfDuplicatesLists;
     }
 
     private String getFileKey(File file) {
@@ -406,7 +487,7 @@ public class FileDuplicateFinderCleanerController {
     }
 
     private void showMessage(String message) {
-        Alert alert = new Alert(Alert.AlertType.INFORMATION);
+        val alert = new Alert(Alert.AlertType.INFORMATION);
         alert.setTitle("Information");
         alert.setHeaderText(null);
         alert.setContentText(message);
